@@ -1975,6 +1975,14 @@ pub const CAPI = struct {
         return surface.core_surface.getProcessInfo(.foreground_pid) orelse 0;
     }
 
+    /// Returns true if the surface is currently on the alternate screen.
+    export fn ghostty_surface_is_alternate_screen(surface: *Surface) bool {
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
+
+        return surface.core_surface.io.terminal.screens.active_key == .alternate;
+    }
+
     /// Returns the PTY name for the surface. The returned string must be
     /// freed by the caller via ghostty_string_free.
     export fn ghostty_surface_tty_name(surface: *Surface) String {

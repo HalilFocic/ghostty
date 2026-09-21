@@ -121,7 +121,13 @@ extension Ghostty {
             return Int(exactly: pid)
         }
 
-        /// The PTY device name for this surface.
+        /// Whether the terminal is currently rendering the alternate screen buffer.
+        @MainActor
+        var isAlternateScreen: Bool {
+            ghostty_surface_is_alternate_screen(surface)
+        }
+
+        /// The name of the PTY device for this surface.
         @MainActor
         var ttyName: String? {
             let ttyName = AllocatedString(ghostty_surface_tty_name(surface)).string

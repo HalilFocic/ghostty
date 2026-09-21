@@ -198,6 +198,32 @@ extension Ghostty {
 
         // This is set to non-null during keyDown to accumulate insertText contents
         private var keyTextAccumulator: [String]?
+
+        /// An AppKit command produced while interpreting the current key event.
+        /// This is only a fallback: explicit Ghostty keybindings take precedence.
+        private var appKitKeyCommand: AppKitKeyCommand?
+
+        /// Key-down events consumed by an AppKit fallback. Their matching
+        /// key-up must also be consumed so extended keyboard reporting cannot
+        /// forward half of a handled command to the PTY.
+        private var appKitConsumedKeyCodes: Set<UInt16> = []
+
+        enum AppKitKeyCommand: Equatable {
+            case top
+            case bottom
+            case pageUp
+            case pageDown
+
+            var bindingAction: String {
+                switch self {
+                case .top: "scroll_to_top"
+                case .bottom: "scroll_to_bottom"
+                case .pageUp: "scroll_page_up"
+                case .pageDown: "scroll_page_down"
+                }
+            }
+        }
+
         /// Temporary lead surrogate that's waiting for the trail
         private var leadSurrogate: LeadSurrogate?
 
@@ -1099,6 +1125,10 @@ extension Ghostty {
         }
 
         override func keyDown(with event: NSEvent) {
+            // Clear a stale entry if focus changed before AppKit delivered the
+            // prior key-up. A handled event below adds it back.
+            appKitConsumedKeyCodes.remove(event.keyCode)
+
             guard let surface = self.surface else {
                 self.interpretKeyEvents([event])
                 return
@@ -1156,7 +1186,11 @@ extension Ghostty {
             // we call interpretKeyEvents so that we can handle complex input such as Korean
             // language.
             keyTextAccumulator = []
-            defer { keyTextAccumulator = nil }
+            appKitKeyCommand = nil
+            defer {
+                keyTextAccumulator = nil
+                appKitKeyCommand = nil
+            }
 
             // We need to know what the length of marked text was before this event to
             // know if these events cleared it.
@@ -1184,6 +1218,20 @@ extension Ghostty {
                 return
             }
 
+            // A configured Ghostty binding takes precedence over an AppKit
+            // fallback. Only query bindings when interpretation actually
+            // produced one of the navigation commands handled below.
+            let ghosttyBindingExists = if appKitKeyCommand != nil {
+                surfaceModel?.keyIsBinding(
+                    event.ghosttyKeyEvent(
+                        action,
+                        translationMods: translationEvent.modifierFlags
+                    )
+                ) != nil
+            } else {
+                false
+            }
+
             // If we have marked text, we're in a preedit state. The order we
             // do this and the key event callbacks below doesn't matter since
             // we control the preedit state only through the preedit API.
@@ -1196,6 +1244,23 @@ extension Ghostty {
             // or ctrl+h. This should only cancel the composing state but not
             // actually delete the prior input characters (prior to the composing).
             let composing = markedText.length > 0 || markedTextBefore
+
+            // AppKit scrolling is a fallback between Ghostty keybindings and
+            // terminal encoding. Only attempt it when input interpretation did
+            // not produce or modify any composed text and the primary screen is
+            // active. Alternate-screen applications receive the navigation key.
+            let appKitCommandHandled: Bool
+            if let command = Self.appKitKeyCommandToPerform(
+                appKitKeyCommand,
+                ghosttyBindingExists: ghosttyBindingExists,
+                composing: composing,
+                accumulatedTextIsEmpty: keyTextAccumulator?.isEmpty == true,
+                isAlternateScreen: surfaceModel?.isAlternateScreen ?? false
+            ) {
+                appKitCommandHandled = performAppKitKeyCommand(command)
+            } else {
+                appKitCommandHandled = false
+            }
 
             // The input method may commit all or part of the preedit text via
             // insertText while handling a key that should not itself be
@@ -1258,6 +1323,13 @@ extension Ghostty {
                     return
                 }
 
+                // The AppKit fallback was performed on the primary screen, so
+                // consuming here prevents the navigation key from also reaching the PTY.
+                if appKitCommandHandled {
+                    appKitConsumedKeyCodes.insert(event.keyCode)
+                    return
+                }
+
                 // We have no accumulated text so this is a normal key event.
                 _ = keyAction(
                     action,
@@ -1269,7 +1341,52 @@ extension Ghostty {
             }
         }
 
+        static func appKitKeyCommand(for selector: Selector) -> AppKitKeyCommand? {
+            switch selector {
+            case #selector(NSResponder.scrollToBeginningOfDocument(_:)):
+                .top
+            case #selector(NSResponder.scrollToEndOfDocument(_:)):
+                .bottom
+            case #selector(NSResponder.scrollPageUp(_:)):
+                .pageUp
+            case #selector(NSResponder.scrollPageDown(_:)):
+                .pageDown
+            default:
+                nil
+            }
+        }
+
+        static func appKitKeyCommandToPerform(
+            _ command: AppKitKeyCommand?,
+            ghosttyBindingExists: Bool,
+            composing: Bool,
+            accumulatedTextIsEmpty: Bool,
+            isAlternateScreen: Bool
+        ) -> AppKitKeyCommand? {
+            guard !ghosttyBindingExists,
+                  !composing,
+                  accumulatedTextIsEmpty,
+                  !isAlternateScreen else { return nil }
+
+            return command
+        }
+
+        private func performAppKitKeyCommand(_ command: AppKitKeyCommand) -> Bool {
+            guard let surface else { return false }
+
+            let action = command.bindingAction
+            return ghostty_surface_binding_action(
+                surface,
+                action,
+                UInt(action.lengthOfBytes(using: .utf8))
+            )
+        }
+
         override func keyUp(with event: NSEvent) {
+            if appKitConsumedKeyCodes.remove(event.keyCode) != nil {
+                return
+            }
+
             _ = keyAction(GHOSTTY_ACTION_RELEASE, event: event)
         }
 
@@ -2117,6 +2234,14 @@ extension Ghostty.SurfaceView: NSTextInputClient {
     /// 1. Prevents an audible NSBeep for unimplemented actions.
     /// 2. Allows us to properly encode super+key input events that we don't handle
     override func doCommand(by selector: Selector) {
+        // AppKit commands produced from inside keyDown are recorded and
+        // evaluated after text interpretation. This keeps explicit Ghostty
+        // bindings ahead of AppKit fallback behavior.
+        if keyTextAccumulator != nil,
+           let command = Self.appKitKeyCommand(for: selector) {
+            appKitKeyCommand = command
+        }
+
         // If we are being processed by performKeyEquivalent with a command binding,
         // we send it back through the event system so it can be encoded.
         if let lastPerformKeyEvent,
